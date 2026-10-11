@@ -603,9 +603,10 @@ def _razor_component_name(name: str) -> str | None:
 # Astro
 # ---------------------------------------------------------------------------
 
-# The ``---`` fence opens the file (after an optional BOM). Astro also closes
-# on an indented ``---`` or one right after a ``;`` / ``}`` on the same line;
-# a ``// ---`` divider comment matches neither.
+# The ``---`` fence opens the file after an optional BOM and any whitespace, as
+# in Astro's compiler (``FrontmatterInitial``). Astro also closes on an
+# indented ``---`` or one right after a ``;`` / ``}`` on the same line; a
+# ``// ---`` divider comment matches neither.
 # shortcut: a ``---`` line inside a template literal closes the block early
 # (Astro reads strings); fine until a real file does that.
 _ASTRO_FRONTMATTER = re.compile(
@@ -615,17 +616,21 @@ _ASTRO_FRONTMATTER = re.compile(
 # ``<!--`` and a markup ``{/* */}`` hide text that may mention ``<script>``; a
 # bare ``/*`` is not a comment in markup (``accept="audio/*"``). A ``<style>``
 # body is hidden whole, which covers its CSS comments. Case-sensitive: Astro
-# reads ``<Script>`` as a component. Attribute values may hold ``>`` (``=>``).
+# reads ``<Script>`` as a component. Attribute values may hold ``>`` (``=>``);
+# any other start tag is consumed whole, so ``<script>`` in its values is skipped.
 # shortcut: a ``{...}`` value nested 3+ braces deep is not read as an opener;
 # widen the brace group once a real file does that.
+# shortcut: a ``<script>`` in a JS string of a child ``{...}`` expression still
+# opens one (``{cond && <script>}`` must); read JS strings once a real file does that.
 _ASTRO_OPENER = re.compile(
-    rb"(<!--|\{/\*)|<(script|style)(?=[\s/>])"
-    rb"((?:\"[^\"]*\"|'[^']*'|\{(?:[^{}]|\{[^{}]*\})*\}|[^>\"'{])*)>"
+    rb"(<!--|\{/\*)|<(?:(script|style)|[A-Za-z][\w.-]*)(?=[\s/>])"
+    rb"((?:\"[^\"]*(?:\"|\Z)|'[^']*(?:'|\Z)|\{(?:[^{}]|\{[^{}]*\})*\}|[^>\"'{])*)(?:>|\Z)"
 )
 _ASTRO_COMMENT_CLOSE = {b"<!--": _HTML_COMMENT_CLOSE, b"{/*": b"*/"}
+# An unterminated body runs to EOF (``\Z``).
 _ASTRO_CLOSE = {
-    b"script": re.compile(rb"</script\s*>", re.IGNORECASE),
-    b"style": re.compile(rb"</style\s*>", re.IGNORECASE),
+    b"script": re.compile(rb"</script\s*>|\Z", re.IGNORECASE),
+    b"style": re.compile(rb"</style\s*>|\Z", re.IGNORECASE),
 }
 _ASTRO_SCRIPT_TYPE = re.compile(rb"""(?<![\w.-])type\s*=(?!=)\s*["']?([^"'\s>]+)""", re.IGNORECASE)
 # A ``<script>`` with any other ``type`` (``application/ld+json``) holds data.
@@ -650,8 +655,8 @@ def _astro_byte_scan(source: bytes, state: dict) -> None:
         markup_start = frontmatter.end()
     hidden = _astro_record_scripts(source, markup_start, state)
 
-    # shortcut: a TS generic inside a markup {expr} (``Array<Foo>``) reads as a
-    # <Foo> tag; fine until a false component edge shows up in a real repo.
+    # shortcut: a TS generic inside a markup {expr} (``Array<Foo>``) or a tag inside a
+    # string reads as a tag; fine until a false component edge shows up in a real repo.
     _byte_scan_tags(source, [*state["spans"], *hidden], _astro_component_name, state)
 
 
@@ -670,16 +675,16 @@ def _astro_record_scripts(source: bytes, pos: int, state: dict) -> list[tuple[in
         # shortcut: a <script src="./x.ts"> mints no import, so a file loaded
         # only that way reads as unreachable; emit an Import as
         # lightweight_imports/html.py does once a site needs it.
-        if attrs.rstrip().endswith(b"/"):  # <script src="..." /> or <style />
+        if tag is None or attrs.rstrip().endswith(b"/"):  # another tag, or <script src="..." />
             pos = opener.end()
             continue
         close_match = _ASTRO_CLOSE[tag].search(source, opener.end())
-        end = close_match.start() if close_match else len(source)
+        end = close_match.start()
         if _astro_is_js_script(tag, attrs):
             state["spans"].append((opener.end(), end))
             state["terminators"].append(opener.end() - 1)
         hidden.append((opener.start(), end))
-        pos = close_match.end() if close_match else end
+        pos = close_match.end()
     return hidden
 
 

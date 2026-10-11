@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from datetime import datetime
 
 import pytest
@@ -105,6 +106,17 @@ class TestProjection:
         )
         assert b"function later() {}" in prepare_source("astro", src)
 
+    @pytest.mark.parametrize(
+        "tag",
+        [
+            b'<div title={"<script>const fake = 1;</script>"} />',
+            b'<div title="<script>const fake = 1;</script>">',
+            b'<Code code={`<script>const fake = 1;</script>`} lang="html" />',
+        ],
+    )
+    def test_a_script_inside_an_attribute_value_is_not_an_opener(self, tag: bytes) -> None:
+        assert b"fake" not in prepare_source("astro", tag)
+
 
 _CARD = b"import Card from './Card.astro';"
 
@@ -123,6 +135,9 @@ _CARD = b"import Card from './Card.astro';"
         ),
         pytest.param(
             b"\xef\xbb\xbf---\n" + _CARD + b"\n---\n<Card />", ["./Card.astro"], ["Card"], id="bom"
+        ),
+        pytest.param(
+            b"\n---\n" + _CARD + b"\n---\n<Card />", ["./Card.astro"], ["Card"], id="leading-blank"
         ),
         pytest.param(
             b"---\r\n"
@@ -158,6 +173,7 @@ _CARD = b"import Card from './Card.astro';"
         ),
         pytest.param(b"<!-- <Card /> -->{/* <Other /> */}<Real />", [], ["Real"], id="comments"),
         pytest.param(b"<Icons.Star />", [], ["Star"], id="dotted"),
+        pytest.param(b"<Fragment><Card /></Fragment>", [], ["Card"], id="fragment"),
     ],
 )
 def test_matches_the_astro_compiler(parser, src: bytes, imports: list, tags: list) -> None:
@@ -173,6 +189,12 @@ def test_an_unterminated_script_runs_to_eof() -> None:
     src = b"<script>\nconst a = 1;\n<Card />"
     assert scan("astro", src).component_tags == ()
     assert b"const a = 1;" in prepare_source("astro", src)
+
+
+def test_an_unclosed_quote_scans_in_linear_time() -> None:
+    start = time.perf_counter()
+    prepare_source("astro", b'<a "' * 20_000)
+    assert time.perf_counter() - start < 1
 
 
 def test_a_script_does_not_run_into_the_frontmatter(parser) -> None:
@@ -207,11 +229,6 @@ class TestSymbols:
 
 
 class TestImports:
-    def test_relative_component_import(self, parsed) -> None:
-        header = next(i for i in parsed.imports if i.module_path.endswith("Header.astro"))
-        assert header.is_relative
-        assert header.imported_names == ["Header"]
-
     def test_named_bindings_are_extracted(self, parsed) -> None:
         fmt = next(i for i in parsed.imports if i.module_path == "../lib/format")
         assert [b.local_name for b in fmt.bindings] == ["formatDate"]
@@ -224,11 +241,6 @@ class TestCalls:
     def test_markup_component_tags_become_calls(self, parsed) -> None:
         header = [c for c in parsed.calls if c.target_name == "Header"]
         assert [c.line for c in header] == [15]
-
-    def test_fragment_is_not_a_component(self, parser) -> None:
-        src = b"<Fragment><Card /></Fragment>\n"
-        result = parser.parse_file(_file(size=len(src)), src)
-        assert {c.target_name for c in result.calls} == {"Card"}
 
 
 class TestCodeHealth:

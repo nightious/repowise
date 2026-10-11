@@ -643,7 +643,7 @@ and offset invariants are shared; adding a markup language means adding a
 |---|---|---|---|---|
 | Grammar | `tree-sitter-svelte` | `tree-sitter-html` | none; byte scan, projected to C# | none; byte scan, projected to TS |
 | Expression nodes | `svelte_raw_text` under `expression` / `if_start` / `key_start` / `html_tag` | `attribute_value` inside `quoted_attribute_value`; `{{ … }}` scanned inside `text` | brace-matched `@code { }`, `@functions { }`, `@{ }` interiors | the `---` frontmatter and every JS `<script>` body (plain, `is:inline`, `type="module"`, `define:vars`); markup `{expr}` is blanked |
-| Fence bytes | the surrounding `{` `}` | the surrounding `"` or `'` | the surrounding `{` `}` | none |
+| Fence bytes | the surrounding `{` `}` | the surrounding `"` or `'` | the surrounding `{` `}` | the `>` of each `<script>` opening tag |
 | Skipped binding forms | `{#each}`, `{#await}` heads | `v-for`, `v-slot` / `#default` | `@using`, `@inject`, `@bind`, `@on*`, `@model`, inline `@expr` | markup `{expr}` |
 | Non-component tags | the `svelte:*` namespace | `<KeepAlive>`, `<Transition>`, `<RouterView>`, … in either spelling | lowercase elements; anything inside `@* *@` or `<!-- -->` | lowercase elements, `<Fragment>`; anything inside `<!-- -->` or a `<script>` |
 
@@ -693,8 +693,6 @@ thing that names a component) and `<Foo />` instantiation call edges (via
 `component_call_sites`, the analogue of `tsx.scm`'s JSX captures). For Vue both
 run the filename and the tag through the *same* normaliser, so `back-to-top.vue`
 and `<back-to-top />` cannot disagree about the name `BackToTop`.
-
-The same steps would fit Astro components; only the locator changes.
 
 ---
 
