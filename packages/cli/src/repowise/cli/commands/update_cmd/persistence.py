@@ -292,18 +292,38 @@ def refresh_read_snapshots(repo_path: Any) -> None:
     overview and the dashboard read one row instead of rebuilding in each new
     process. A view no write has invalidated since is left as it is, so the
     "already up to date" path costs one primary-key read per view.
-    Best-effort: without a snapshot a reader builds live, as before.
+    Best-effort: without a snapshot a reader builds live, as before. A
+    snapshot that is not written is named with its error, here rather than in
+    the core log, which an update keeps at ERROR.
     """
     from repowise.cli.helpers import repo_index_session
     from repowise.core.persistence.crud.analysis.actions import write_read_snapshots
 
-    async def _run() -> None:
+    async def _run() -> list[tuple[str, Exception]]:
         async with repo_index_session(Path(repo_path)) as opened:
-            if opened is not None:
-                await write_read_snapshots(*opened)
+            return [] if opened is None else await write_read_snapshots(*opened)
 
-    with contextlib.suppress(Exception):
-        run_async(_run())
+    try:
+        try:
+            failed = run_async(_run())
+        except Exception as exc:
+            failed = [("read snapshots", exc)]
+        for name, exc in failed:
+            log.debug("read_snapshot_not_written", snapshot=name, error=repr(exc))
+            console.print(f"[yellow]Snapshot not written: {_short_error(name, exc)}[/yellow]")
+    except Exception:  # reporting must never fail the update
+        log.debug("read_snapshot_report_failed", exc_info=True)
+
+
+def _short_error(name: str, exc: BaseException) -> str:
+    """``<snapshot>: <ErrorType>: <first line>``, cut to one line and escaped
+    for Rich: an error text can hold markup brackets or a whole traceback."""
+    from rich.markup import escape
+
+    first = (str(exc).strip().splitlines() or [""])[0]
+    if len(first) > 160:
+        first = first[:159] + "…"
+    return escape(f"{name}: {type(exc).__name__}" + (f": {first}" if first else ""))
 
 
 # A repair window that has grown past this many commits stopped being a repair
@@ -528,6 +548,7 @@ def _persist_index_only_update(
     full_git_summary: Any | None = None,
     reconcile_full_scope: bool = False,
     full_generation_page_ids: set[str] | None = None,
+    stamp_renderer: bool = True,
     dependency_fingerprints: dict[str, str] | None = None,
     vector_store: Any | None = None,
     require_config_rebuild_success: bool = False,
@@ -541,6 +562,9 @@ def _persist_index_only_update(
     periodic gate. Set by the config-changed caller, which relies on this path
     rather than re-scoring separately and returning — doing that advanced
     ``last_sync_commit`` past commits it never indexed.
+
+    ``stamp_renderer`` False keeps the stored renderer fingerprint: the full
+    re-render a renderer change asked for failed, so the next run retries it.
 
     ``timings`` is the run's phase table. Its ``run`` row is closed here, at
     the state write, and the whole table lands in ``state.json`` as
@@ -623,7 +647,11 @@ def _persist_index_only_update(
         # update pays a full reparse forever even though nothing is stale. This
         # is the keyless hot path (the post-commit hook), so a lingering reparse
         # here is exactly the cost the mode exists to avoid.
-        "renderer_fingerprint": _current_renderer_fingerprint(repo_path),
+        "renderer_fingerprint": (
+            _current_renderer_fingerprint(repo_path)
+            if stamp_renderer
+            else state.get("renderer_fingerprint")
+        ),
     }
     _stamp_git_history(new_state, full_git_summary, failed_steps)
     # Before save_state, and reading ``state`` (the pre-update dict) for the old
@@ -1821,12 +1849,16 @@ def parser_changed(repo_path: Path) -> bool:
     """Whether the stored graph edges were written by a different parser.
 
     Compares the fingerprint ``persist_incremental_edges`` stamped on the repo
-    row with the running ``parser_fingerprint()``. An unstamped row, or a store
-    that cannot be read, is **not** a change, for the reason
-    :func:`health_analyzer_changed` gives: the next commit's widen stamps it.
+    row with the running ``parser_fingerprint()``. An unstamped row **is** a
+    change: ``init`` stamps a fresh store, so an unstamped one was written
+    before the stamp or re-indexed over older edges, and the re-parse this
+    triggers is the widen that reconciles and stamps it. Reading absence as
+    current let a parser-only release report "already up to date" on a quiet
+    checkout. A store that cannot be read, has no repository row, or has no
+    edges to reconcile, is not.
 
-    Also true when a test file was never checked for walking the source tree
-    (an index built before that check): selection would run everything until
+    Also true when a test file was never checked for reaching code outside its
+    imports (an index built before that check): selection would run everything until
     the re-parse stamps it, so a quiet repo must not take the shortcut.
     """
     from repowise.cli.helpers import get_db_url_for_repo
@@ -1838,26 +1870,33 @@ def parser_changed(repo_path: Path) -> bool:
         get_repository_by_path,
         get_session,
     )
+    from repowise.core.pipeline.persist import has_graph_edges
 
-    async def _stored() -> tuple[str | None, bool]:
+    async def _stored() -> bool:
         engine = create_engine(get_db_url_for_repo(repo_path))
         try:
             sf = create_session_factory(engine)
             async with get_session(sf) as session:
                 repo = await get_repository_by_path(session, str(repo_path))
                 if repo is None:
-                    return None, False
-                unscanned = bool(await unscanned_test_files(session, repo.id))
-                return repo.graph_edges_parser_fingerprint, unscanned
+                    return False
+                stored = repo.graph_edges_parser_fingerprint
+                if stored is None:
+                    # Unstamped with no edges is a store nothing ever indexed
+                    # into: there is nothing a re-parse could reconcile.
+                    if await has_graph_edges(session, repo.id):
+                        return True
+                elif stored != parser_fingerprint():
+                    return True
+                return bool(await unscanned_test_files(session, repo.id))
         finally:
             await engine.dispose()
 
     try:
-        stored, unscanned = run_async(_stored())
+        return run_async(_stored())
     except Exception as exc:
         log.debug("parser_change_check_failed", error=str(exc))
         return False
-    return unscanned or (stored is not None and stored != parser_fingerprint())
 
 
 def health_analyzer_changed(state: dict) -> bool:

@@ -8,6 +8,8 @@
  * first segment of `file_path`.
  */
 
+import type { GatedByLanguage } from "./health.js";
+
 export type DeadCodeStatus = "open" | "acknowledged" | "resolved" | "false_positive";
 
 /**
@@ -105,6 +107,9 @@ export interface DeadCodeFinding {
   /** Raw engine artifact fields — present in some downstream pipelines, optional here. */
   evidence?: string[] | null;
   age_days?: number | null;
+  /** The measurement note when the row's language cell is served as a preview;
+   *  null or absent for a validated cell. */
+  preview?: string | null;
 }
 
 export interface DeadCodePatchInput {
@@ -119,8 +124,11 @@ export interface DeadCodeSummary {
   total_lines: number;
   by_kind: Record<string, number>;
   /**
-   * ISO 8601 UTC time dead-code analysis last ran. `null` or absent (older
-   * servers) means never ran or unknown, which is not an all-clear.
+   * ISO 8601 UTC time dead-code analysis last ran. `null` means no run is
+   * recorded, which is not an all-clear. Absent means the host does not
+   * report it, and a zero then reads as clean.
    */
   analyzed_at?: string | null;
+  /** What a language gate held back, by language. Empty or absent when nothing was. */
+  gated?: GatedByLanguage;
 }

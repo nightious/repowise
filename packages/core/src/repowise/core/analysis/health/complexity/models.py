@@ -27,6 +27,8 @@ class ConditionComplexity:
     line: int  # 1-indexed start line of the enclosing construct
     operator_count: int
     enclosing_construct: str  # "if" | "while" | "for" | "ternary" | "case"
+    # One operator kind and no negation (``a || b || c``): a list, not a knot.
+    flat_chain: bool = False
 
 
 @dataclass
@@ -52,6 +54,9 @@ class FunctionComplexity:
     # flags below, read only by ``primitive_obsession``. ``complexity/signature.py``.
     typed_param_count: int = 0
     primitive_param_count: int = 0
+    # Of ``param_count``, the ones a framework binds by annotation
+    # (``@PathVariable``); they are in neither count above.
+    bound_param_count: int = 0
     # A constructor, by node kind, conventional name, or its type's name.
     is_constructor: bool = False
     # The parameter list is set by another declaration (an override, an
@@ -223,6 +228,11 @@ class ClassComplexity:
     # Every method is fixed by a contract the class implements (a Rust
     # ``impl Trait for T``): none can move out, and cohesion is not scored.
     contract_impl: bool = False
+    # Names of the methods that read or write an instance field of this class,
+    # explicitly or by bare name. ``components`` drops single-field groups on
+    # implicit-receiver languages, so a service method using its one injected
+    # repository is only visible here; Move Method reads it.
+    field_readers: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)

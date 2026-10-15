@@ -90,7 +90,8 @@ disable the model calls themselves.
   it and price with the right model) and calls the pricing table only. It is a
   read-only preflight, not a model call.
 - `GET /api/repos/{repo_id}/chat/suggestions` goes through the same grounding
-  reads as chat but makes no model call.
+  reads as chat but makes no model call. With no `target` it only quotes chart
+  datasets already cached for the current index and reads nothing cold.
 - `POST /api/repos/{repo_id}/claude-md/generate` renders `CLAUDE.md` from
   indexed data synchronously, with no LLM call (`routers/claude_md.py`).
 - `POST /api/repos/{repo_id}/blast-radius` is a deterministic graph analysis
@@ -141,13 +142,26 @@ Authorization: Bearer <your-key-value>
 ```
 
 The comparison is constant-time and the prefix must be exactly `Bearer ` with a
-single space (`deps.py`, `verify_api_key` / `bearer_is_valid`; verified: a bare
+single space (`auth.py`, `LocalAuthenticator`; verified: a bare
 key and a double space are both rejected).
 
 The key is read once, at import (`deps.py` line 26). Changing the environment of
 a running server has no effect; restart it. The webhook secrets are the
 exception and are read per request (`routers/webhooks.py`), deliberately, so a
 setting change is picked up without a restart.
+
+Scoped tokens are an optional second credential: list them in
+`~/.repowise/tokens.yaml` (or the file named by `REPOWISE_TOKENS_FILE`) as
+`{id, sha256, repos?, tools?, expires_at?}` entries, where `sha256` is the hex
+digest of the token, `repos`/`tools` narrow what it reaches by repository id or
+name and MCP tool name, and `expires_at` is an ISO 8601 time. A token with
+`tools` is refused on every REST route except chat, which runs only the tools
+in its scope. Every check returns a `Principal`, and the same check guards the
+MCP streamable HTTP and SSE transports, which answer a missing bearer with
+`401` and `WWW-Authenticate: Bearer resource_metadata="..."` pointing at an RFC
+9728 document under `/.well-known/oauth-protected-resource` (set
+`REPOWISE_PUBLIC_URL` when serving behind a proxy). With no key and no tokens
+file, every surface behaves exactly as described below.
 
 ### 2.2 What happens when the header is absent
 
@@ -431,6 +445,14 @@ Six job modes exist (`job_executor.py`, `VALID_JOB_MODES`): `sync`,
 are not addressable by name over HTTP; each is the engine behind the endpoints
 in section 1. The mode is visible in `GET /api/jobs/{id}` under `config.mode`.
 
+A job can complete while its provider failed: each page it could not write
+counts in `failed_pages`, and `config.provider_issue` (`{kind, message}` plus
+optional `provider`, `model`, `target`, or `null`) names a shared cause such as
+a rejected API key (`auth`), a rate limit, an unreachable base URL, a missing
+model or path, or docs skipped because a configured provider would not load
+(`docs_skipped`; a repo with no provider at all is not reported). A job that
+fails on a recognised provider error stores the same hint as its `error_message`.
+
 One job per repository may be `pending` or `running` at a time. A second launch
 is `409`. On startup, the server marks any job left `running` or `pending` by a
 previous process as `failed`, with the message `Server restarted — job
@@ -491,6 +513,8 @@ one per router area; this table maps an area to the tag to open there.
 | Refactoring plans, opportunities, settings, code generation | `refactoring` | `routers/refactoring.py` |
 | Dead-code findings | `dead-code` | `routers/dead_code.py` |
 | Change risk, hotspots, ownership, commits, co-changes | `git` | `routers/git.py` |
+| Merged changes (Change Records) reconstructed from git | `changes` | `routers/changes.py` |
+| Typed events from consecutive index runs (CloudEvents, pull) | `events` | `routers/events.py` |
 | Structural coupling report | `coupling` | `routers/coupling.py` |
 | Blast radius for a change | `blast-radius` | `routers/blast_radius.py` |
 | Architectural decisions, lanes, lineage, policy settings | `decisions` | `routers/decisions.py` |

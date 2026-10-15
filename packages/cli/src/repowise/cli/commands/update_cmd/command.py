@@ -9,6 +9,7 @@ rendering (:mod:`.reporting`).
 
 from __future__ import annotations
 
+import contextlib
 import sys
 import time
 from collections.abc import Callable
@@ -42,6 +43,7 @@ from repowise.cli.helpers import (
 )
 from repowise.core.docs_mode import docs_mode_state_fields, resolve_docs_mode
 from repowise.core.ingestion.git_indexer import (
+    GIT_HISTORY_BACKFILL_REWALK,
     GIT_HISTORY_VERSION,
     GIT_HISTORY_VERSION_KEY,
     git_history_stale,
@@ -1043,9 +1045,23 @@ def run_update(
     # full reparse below happens and the per-page staleness sweep can pick up
     # exactly the pages the old renderer wrote. Distinct from config_changed,
     # which routes to a health re-score rather than to page regeneration.
+    #
+    # A missing stamp is a change: ``init`` stamps every index it builds, so an
+    # unstamped one was written by a release older than the stamp, whose pages
+    # quote that release's graph. Reading absence as current stamped it on the
+    # spot and left the whole wiki a release behind. An empty current value
+    # (the fingerprint failed) still disables the gate, and an index with no
+    # wiki has no page a renderer could have written.
     prev_renderer_fp = state.get("renderer_fingerprint")
     curr_renderer_fp = _current_renderer_fingerprint(repo_path)
-    renderer_changed = prev_renderer_fp is not None and prev_renderer_fp != curr_renderer_fp
+    # A model wiki on an index-only run waits for its next full update, which
+    # is the run that can re-render it.
+    renderer_changed = (
+        bool(curr_renderer_fp)
+        and prev_renderer_fp != curr_renderer_fp
+        and resolve_docs_mode(state) != "none"
+        and not (resolved_index_only and resolve_docs_mode(state) == "llm")
+    )
 
     # Uncommitted work, when the caller asked for it. Computed before the
     # "already up to date" gate below, because on a watched repo that gate is
@@ -1078,6 +1094,12 @@ def run_update(
     # it must not wait on a re-score (7-day decay) or cost an indexing run.
     if not dry_run:
         _repair_module_attribution(repo_path)
+        # Opt-in edit capture: bind pending agent edits to the new commits
+        # before the git walk labels them. A no-op unless capture is on.
+        with contextlib.suppress(Exception):
+            from repowise.core.edit_capture.binder import bind_repo
+
+            bind_repo(Path(repo_path))
 
     analyzer_changed = health_analyzer_changed(state)
     # Stored per-file git rows written under older history rules. Only a full
@@ -1107,9 +1129,17 @@ def run_update(
             if analyzer_changed
             else "[yellow]Parser changed since this index was built; re-parsing.[/yellow]"
         )
+    if renderer_changed:
+        console.print(
+            "[yellow]Wiki renderer changed since these pages were written; "
+            "re-rendering structural pages once, no model needed.[/yellow]"
+        )
     if history_stale:
         console.print(
-            "[yellow]Git history rules changed since this index was built; "
+            "[yellow]Re-reading git history once to label commits from the "
+            "attribution backfill.[/yellow]"
+            if state.get(GIT_HISTORY_VERSION_KEY) == GIT_HISTORY_BACKFILL_REWALK
+            else "[yellow]Git history rules changed since this index was built; "
             "re-reading the full history once.[/yellow]"
         )
     # Deliberately not in ``git_is_current``: the rescan does its own full parse,
@@ -1214,9 +1244,11 @@ def run_update(
         # where an orientation page registered after the index was built is
         # most likely to go unmentioned forever: it returns before the
         # generation code, so nothing else in the run can notice.
+        from .commit_limit_notice import surface_pinned_commit_limit
         from .slot_notice import surface_missing_slots
 
         surface_missing_slots(repo_path, emitter=emitter, dry_run=dry_run)
+        surface_pinned_commit_limit(repo_path, emitter=emitter, dry_run=dry_run)
         if emitter is not None:
             emitter.done(
                 ok=True,
@@ -1342,9 +1374,11 @@ def run_update(
     # An orientation page registered after this index was built cannot arrive
     # below, because this run's parsed_files is the changed-file slice, so name
     # the command that does reach it. Says nothing when there is nothing to say.
+    from .commit_limit_notice import surface_pinned_commit_limit
     from .slot_notice import surface_missing_slots
 
     surface_missing_slots(repo_path, emitter=emitter, dry_run=dry_run)
+    surface_pinned_commit_limit(repo_path, emitter=emitter, dry_run=dry_run)
 
     render_header(repo_path, base_ref, head)
 
@@ -1577,7 +1611,8 @@ def run_update(
             include_submodules=bool(state.get("include_submodules", False)),
             include_nested_repos=bool(state.get("include_nested_repos", False)),
             idle_decay_sink=None if working_tree_only else git_decay_map,
-            force_full_git=git_config_changed or history_stale,
+            # A full re-render quotes every file's history, as init does.
+            force_full_git=git_config_changed or history_stale or renderer_changed,
             git_summary_sink=full_git_summaries,
             timings=timings,
         )
@@ -1631,11 +1666,28 @@ def run_update(
     stale_extra = list(dict.fromkeys([*stale_renderer_paths, *stale_db_paths]))
     if stale_extra:
         affected.regenerate = list(dict.fromkeys([*affected.regenerate, *stale_extra]))
-    if generation_config_changed:
+    if generation_config_changed or renderer_changed:
         # Generation settings affect selection and repo-wide synthesis, not
         # merely the files touched by this commit. Recreate the same complete
-        # page set a clean init would choose.
+        # page set a clean init would choose. A renderer change does the same
+        # for the structural pages: every one quotes the graph an older release
+        # built, and a file that release did not index has no page at all.
         affected.regenerate = [pf.file_info.path for pf in parsed_files]
+    if renderer_changed and not generation_config_changed and not index_only:
+        # A model wiki: the generator below re-renders the file-scoped pages
+        # (all structural) and stops before the model-written levels. Those are
+        # only marked stale, through the same ``none`` cascade a budget overflow
+        # uses, so the rewrite stays the opt-in `generate --stale` it always is.
+        from .deterministic import load_cascade_overflow_split
+
+        affected.decay_only = list(dict.fromkeys([*affected.decay_only, *affected.regenerate]))
+        split = load_cascade_overflow_split(repo_path, affected.regenerate)
+        if split and split[0]:
+            console.print(
+                f"  {split[0]} model-written pages are marked stale: run "
+                "[cyan]repowise generate --stale[/cyan] to rewrite them "
+                "(it estimates the cost first)."
+            )
 
     if affected.stale_due_to_budget > 0:
         from .deterministic import load_cascade_overflow_split
@@ -1664,6 +1716,14 @@ def run_update(
                 outcome=UpdateOutcome.DRY_RUN.value,
             )
         return UpdateOutcome.DRY_RUN
+
+    # Pages re-rendered for files this run did not change need the complexity
+    # the last full health run measured, which only the store still holds.
+    from .deterministic import hydrate_symbol_complexity
+
+    hydrate_symbol_complexity(
+        repo_path, parsed_files, set(affected.regenerate) - {fd.path for fd in file_diffs}
+    )
 
     # ``git_meta_map`` holds this run's changed files only; the dead-code
     # analyzer scores confidence per file and would read every unchanged file
@@ -1739,6 +1799,15 @@ def run_update(
                 "Configuration-driven knowledge-graph refresh failed; the previous "
                 "fingerprint was retained so the next update retries."
             ) from exc
+    elif renderer_changed and knowledge_graph_result is not None:
+        # Same reason for a full re-render: a file's layer comes from the KG,
+        # and a file the old one never saw would render with none.
+        from repowise.cli.state_persistence import save_knowledge_graph_json
+
+        try:
+            save_knowledge_graph_json(repo_path, knowledge_graph_result)
+        except Exception as exc:
+            degraded.append(f"Knowledge-graph publish before render: {exc}")
 
     if index_only:
         # A repo whose wiki was rendered from templates keeps it current here.
@@ -1750,6 +1819,11 @@ def run_update(
         render_stats: dict[str, int] = {}
         index_only_cost = 0.0
         docs_mode = resolve_docs_mode(state)
+        # False when a renderer-driven full render failed: pages outside its
+        # set must not be retired then, and the old stamp stays so the next run
+        # retries. A model wiki renders nothing here, so it keeps its stamp for
+        # the full update that will.
+        renderer_render_ok = docs_mode != "llm"
         if docs_mode == "deterministic":
             from .deterministic import (
                 load_prior_page_ids,
@@ -1782,10 +1856,12 @@ def run_update(
                     degraded=degraded,
                     dead_code_report=dead_code_report,
                     prior_page_ids=prior_ids,
-                    full_scope=generation_config_changed,
+                    full_scope=generation_config_changed or renderer_changed,
                     stats_out=render_stats,
                 )
-                if stale_deterministic_ids and not generation_config_changed:
+                if stale_deterministic_ids and not (
+                    generation_config_changed or renderer_changed
+                ):
                     det_pages.extend(
                         regenerate_deterministic_page_ids(
                             repo_path=repo_path,
@@ -1803,6 +1879,9 @@ def run_update(
                             stats_out=render_stats,
                         )
                     )
+            renderer_render_ok = not renderer_changed or (
+                bool(det_pages) and len(degraded) == degraded_before_render
+            )
             if generation_config_changed and len(degraded) > degraded_before_render:
                 raise RuntimeError(
                     "Configuration-driven page generation failed; the previous "
@@ -1906,9 +1985,11 @@ def run_update(
                 reconcile_full_scope=traversal_config_changed,
                 full_generation_page_ids=(
                     {page.page_id for page in det_pages}
-                    if generation_config_changed and docs_mode == "deterministic"
+                    if docs_mode == "deterministic"
+                    and (generation_config_changed or (renderer_changed and renderer_render_ok))
                     else None
                 ),
+                stamp_renderer=renderer_render_ok,
                 dependency_fingerprints=curr_dependency_fps,
                 vector_store=config_vector_store,
                 require_config_rebuild_success=config_rebuild_required,

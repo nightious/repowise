@@ -784,6 +784,20 @@ async def _edges_predate_cohesion(session: Any, repo_id: str, graph_builder: Any
     return row is None
 
 
+async def has_graph_edges(session: Any, repo_id: str) -> bool:
+    """Whether this repo already has any ``graph_edges`` row."""
+    from sqlalchemy import select
+
+    from repowise.core.persistence.models import GraphEdge
+
+    row = (
+        await session.execute(
+            select(GraphEdge.repository_id).where(GraphEdge.repository_id == repo_id).limit(1)
+        )
+    ).first()
+    return row is not None
+
+
 async def _stored_edges_parser_fingerprint(session: Any, repo_id: str) -> str | None:
     """The ``parser_fingerprint()`` recorded when this repo's edges were written.
 
@@ -804,15 +818,16 @@ async def _stored_edges_parser_fingerprint(session: Any, repo_id: str) -> str | 
 async def stamp_edges_parser_fingerprint(session: Any, repo_id: str, fingerprint: str) -> None:
     """Record the parser build that just wrote this repo's ``graph_edges``.
 
-    Written only by :func:`persist_incremental_edges`, and only after a widen.
-    Deliberately *not* written by the full :func:`persist_ingestion` path, which
-    upserts edges (:func:`batch_upsert_graph_edges`) and prunes only the nodes
-    of files that vanished: a re-index over an existing store therefore adds the
-    new build's edges without removing the old build's surplus ones. Stamping
-    there would mark such a store parser-current and permanently suppress the
-    delete-then-insert reconcile that is the only thing which clears them. The
-    cost of not stamping is one widen on the first update after an index, which
-    is wasted on a fresh store and exactly the repair on a re-indexed one.
+    Written by :func:`persist_incremental_edges` after a widen, and by the full
+    :func:`persist_ingestion` path only when the store held no edges before it.
+    That path upserts edges (:func:`batch_upsert_graph_edges`) and prunes only
+    the nodes of files that vanished, so a re-index over an existing store adds
+    the new build's edges without removing the old build's surplus ones.
+    Stamping such a store would mark it parser-current and permanently suppress
+    the delete-then-insert reconcile that is the only thing which clears them;
+    it stays unstamped, and the first update widens. A fresh store has no
+    surplus, so it is stamped: unstamped, the next parser change could not be
+    told apart from "already up to date" on a quiet checkout.
     """
     from sqlalchemy import update
 
@@ -854,7 +869,9 @@ async def persist_incremental_edges(
     change; :func:`_edges_predate_cohesion` is the bespoke predecessor, kept
     until shipped stores have all been stamped.
     """
-    if graph_builder is None or not parsed_files:
+    # An empty parse still counts: a repo with no source files has nothing to
+    # widen, and it must be stamped, or a missing stamp re-parses it forever.
+    if graph_builder is None or parsed_files is None:
         return
     from repowise.core.ingestion.parse_cache import parser_fingerprint
     from repowise.core.persistence.crud import reconcile_edges_for_files
@@ -873,26 +890,28 @@ async def persist_incremental_edges(
         logger.info("graph_edges_cohesion_backfill", repo_id=repo_id, files=len(changed_paths))
 
     reconcile_paths, edges = _changed_file_edges(graph_builder, parsed_files, changed_paths)
-    if not reconcile_paths:
-        return
-    await reconcile_edges_for_files(session, repo_id, reconcile_paths, edges)
+    if reconcile_paths:
+        await reconcile_edges_for_files(session, repo_id, reconcile_paths, edges)
+        # Every reconciled file, not only a widen's: a symbol renamed or removed
+        # in a changed file otherwise keeps its node beside the new one.
+        await _prune_vanished_symbol_nodes(session, repo_id, graph_builder, reconcile_paths)
     # Only after the widen actually ran to completion. Raising here (or in any
     # caller before the commit) leaves the old stamp, so the next update retries
     # rather than stranding the files it never reached.
     if parser_changed:
-        await _prune_vanished_symbol_nodes(session, repo_id, graph_builder, parsed_files)
         await stamp_edges_parser_fingerprint(session, repo_id, fingerprint)
 
 
 async def _prune_vanished_symbol_nodes(
-    session: Any, repo_id: str, graph_builder: Any, parsed_files: list[Any]
+    session: Any, repo_id: str, graph_builder: Any, paths: list[str]
 ) -> None:
-    """Delete symbol ``graph_nodes`` a re-extraction no longer produces.
+    """Delete symbol ``graph_nodes`` of *paths* a re-extraction no longer produces.
 
     ``persist_graph_nodes`` upserts the current graph and never deletes, so a
-    symbol whose id changed under a new parser (an overload gaining its own id)
-    would otherwise keep its old row beside the new ones. Scoped to files this
-    run parsed; a file that is gone is :func:`_prune_stale_file_rows`'s job.
+    symbol whose id changed (a rename, or an overload gaining its own id under
+    a new parser) would otherwise keep its old row beside the new ones. Scoped
+    to files this run reconciled; a file that is gone is
+    :func:`_prune_stale_file_rows`'s job.
     Membership rows prune themselves on their next write, and ``graph_metrics``
     holds files only.
     """
@@ -901,7 +920,6 @@ async def _prune_vanished_symbol_nodes(
     from repowise.core.persistence.models import GraphEdge, GraphNode
 
     graph = graph_builder.graph()
-    paths = [pf.file_info.path for pf in parsed_files]
     stale: list[str] = []
     for i in range(0, len(paths), _PRUNE_CHUNK):
         rows = await session.execute(
@@ -1712,8 +1730,13 @@ async def persist_ingestion(result: Any, session: Any, repo_id: str) -> int:
     # ---- Graph edges ---------------------------------------------------------
     graph = result.graph_builder.graph()
     edges = [_edge_row(u, v, data) for u, v, data in graph.edges(data=True)]
+    fresh_store = not await has_graph_edges(session, repo_id)
     if edges:
         await batch_upsert_graph_edges(session, repo_id, edges)
+    if fresh_store:
+        from repowise.core.ingestion.parse_cache import parser_fingerprint
+
+        await stamp_edges_parser_fingerprint(session, repo_id, parser_fingerprint())
 
     # ---- External systems (C4 L1) -------------------------------------------
     # Persist before symbols so the FK linkage step below sees the IDs.
@@ -1799,6 +1822,7 @@ async def persist_git(result: Any, session: Any, repo_id: str) -> None:
     ``(repo_id, sha)`` — safe to call incrementally and on resume.
     """
     from repowise.core.persistence.crud import (
+        clear_attribution_if_disabled,
         prune_fix_events_before,
         update_repo_git_totals,
         upsert_fix_events_bulk,
@@ -1820,6 +1844,9 @@ async def persist_git(result: Any, session: Any, repo_id: str) -> None:
     commit_file_rows = getattr(summary, "commit_file_rows", None)
     if commit_file_rows:
         await upsert_git_commit_files_bulk(session, repo_id, commit_file_rows)
+    await clear_attribution_if_disabled(session, repo_id)
+    if summary is not None:
+        await _rebuild_changes(session, repo_id)
 
     # Per fix-commit x file rows (with their SZZ candidates). The prune keeps a
     # re-index of an already-indexed repo from leaving behind events that have
@@ -1861,6 +1888,20 @@ async def persist_git(result: Any, session: Any, repo_id: str) -> None:
             total_lines_deleted=totals.total_lines_deleted,
             churn_anchor_sha=getattr(totals, "churn_anchor_sha", None),
         )
+
+
+async def _rebuild_changes(session: Any, repo_id: str) -> None:
+    """Change records from the same history, after the commit labels they read."""
+    from repowise.core.changes.store import refresh_changes
+    from repowise.core.persistence.models import Repository
+
+    try:
+        repo = await session.get(Repository, repo_id)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("changes_repo_lookup_failed", repo_id=repo_id, error=str(exc))
+        return
+    if repo is not None and repo.local_path:
+        await refresh_changes(session, repo_id, repo.local_path, rebuild=True)
 
 
 async def replace_git_history(
@@ -1932,6 +1973,7 @@ async def persist_git_refresh(
     from sqlalchemy import select
 
     from repowise.core.persistence.crud import (
+        clear_attribution_if_disabled,
         recompute_git_percentiles,
         upsert_git_metadata_bulk,
     )
@@ -1955,6 +1997,7 @@ async def persist_git_refresh(
         ]
     await upsert_git_metadata_bulk(session, repo_id, [*git_meta_map.values(), *decay_rows])
     await recompute_git_percentiles(session, repo_id)
+    await clear_attribution_if_disabled(session, repo_id)
 
 
 async def _analyzed_commit(session: Any, repo_id: str) -> str | None:
@@ -1991,6 +2034,7 @@ async def snapshot_health_from_store(session: Any, repo_id: str) -> None:
     """
     from sqlalchemy import select
 
+    from repowise.core.analysis.health.ranking import deduction_by_path
     from repowise.core.analysis.health.scoring import compute_kpis
     from repowise.core.analysis.health.trends import snapshot_fields
     from repowise.core.persistence.crud import get_hotspot_file_paths, save_health_snapshot
@@ -2020,7 +2064,11 @@ async def snapshot_health_from_store(session: Any, repo_id: str) -> None:
             .scalars()
             .all()
         )
-        kpis = compute_kpis(metrics, await get_hotspot_file_paths(session, repo_id))
+        kpis = compute_kpis(
+            metrics,
+            await get_hotspot_file_paths(session, repo_id),
+            deductions=deduction_by_path(findings),
+        )
         fields = snapshot_fields(kpis, metrics, findings)
         if fields is not None:
             await save_health_snapshot(session, repo_id, **fields)

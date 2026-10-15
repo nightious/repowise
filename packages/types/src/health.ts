@@ -351,6 +351,9 @@ export interface HealthFinding {
   /** Why the finding can wait ("lower priority: ..."); null when it is worth
    *  doing first. Lower-priority findings are listed after the rest. */
   lower_priority?: string | null;
+  /** The measurement note when the row's language cell is served as a preview;
+   *  null or absent for a validated cell. */
+  preview?: string | null;
 }
 
 export type PerformanceExecutionContext = "production" | "tooling" | "test" | "unknown";
@@ -524,6 +527,9 @@ export interface PerformanceOpportunity {
   /** Why the opportunity can wait ("lower priority: ..."); null when its
    *  production loop is known to grow with the data. */
   lower_priority?: string | null;
+  /** The measurement note when the row's language cell is served as a preview;
+   *  null or absent for a validated cell. */
+  preview?: string | null;
   /** Exact stored match. Never inferred from file, marker, or rank. */
   plan_id: string | null;
   plan_status: PerformancePlanStatus;
@@ -654,8 +660,17 @@ export type PerformanceQueueExclusion =
 
 export interface PerformanceDefaultQueue {
   total: number;
-  excluded: Record<PerformanceQueueExclusion, number>;
+  /** Per reason; a server that predates a reason leaves it out. */
+  excluded: Partial<Record<PerformanceQueueExclusion, number>>;
 }
+
+/**
+ * A layer held back pending verification on a language is left out on files
+ * of that language unless the caller opts in (`include_unverified`). Keyed by
+ * language tag (`java`, `csharp`, `c`, `cpp`, `kotlin`, `swift`); `reason`
+ * is the sentence to show.
+ */
+export type GatedByLanguage = Record<string, { count: number; reason: string }>;
 
 export interface PerformanceOpportunitySummary {
   /** `current` once materialized, `stale_model` after a model bump, or
@@ -683,11 +698,15 @@ export interface PerformanceOpportunitySummary {
   /** Why the queue is not current, when it is not. */
   reason?: string;
   detail?: string;
+  /** What a language gate held back, by language. Empty or absent when nothing was. */
+  gated?: GatedByLanguage;
 }
 
 export interface PerformanceOpportunityPage extends Paginated<PerformanceOpportunity> {
   summary: PerformanceOpportunitySummary;
   facets: PerformanceFacets;
+  /** What a language gate held back, by language. Empty or absent when nothing was. */
+  gated?: GatedByLanguage;
   /** Filter values the server did not recognize, named rather than dropped. */
   ignored_arguments?: Record<string, string>;
   /** The causes' count vocabulary over the open inventory in the queried files. */
@@ -724,6 +743,9 @@ export interface HealthOverviewSummary {
   /** Files left out of every figure here because health has no dialect for
    *  their language. Absent on an older server. */
   unanalysed_file_count?: number;
+  /** Scored files over all code files, 0-1; `null` with no code files. Absent
+   *  on an older server. */
+  analysed_share?: number | null;
   hotspot_health?: number | null;
   worst_performer_path: string | null;
   worst_performer_score: number | null;
@@ -738,8 +760,10 @@ export interface HealthOverviewSummary {
     medium: number;
     low: number;
   };
-  /** Repo-level band derived from `average_health` (added in the band/distribution layer). */
-  band?: HealthBand;
+  /** Repo-level band derived from `average_health` (added in the band/distribution layer).
+   *  `null` when no file is scored or too few code files were analysed to grade
+   *  the repo; absent on an older server. */
+  band?: HealthBand | null;
   /**
    * NLOC-weighted repo headline for the maintainability pillar (the second
    * surfaced signal). `null`/absent when no file carries a maintainability
@@ -776,6 +800,8 @@ export interface HealthOverviewSummary {
   counts?: HealthCounts;
   /** Files a code-shape reading cannot answer for, having no recorded split. */
   unscored_files?: number;
+  /** What a language gate held back, by language. Empty or absent when nothing was. */
+  gated?: GatedByLanguage;
 }
 
 export interface HealthOverviewResponse {
@@ -948,6 +974,8 @@ export interface FileBreakdownCategory {
 
 export interface HealthFileBreakdownResponse {
   file_path: string;
+  /** What a language gate held back, by language. Empty or absent when nothing was. */
+  gated?: GatedByLanguage;
   metric: HealthFileMetric | null;
   /** `null` for a file with no score (no health dialect for its language). */
   breakdown: {
@@ -1051,7 +1079,10 @@ export interface FileHealthTrend {
 export interface HealthTrendResponse {
   history: Array<{
     taken_at: string | null;
-    /** `null` under a narrowed scope, which recorded only the average. */
+    /**
+     * `null` under a narrowed scope, which recorded only the average, and on
+     * the full scope when that snapshot recorded no hotspot files.
+     */
     hotspot_health: number | null;
     average_health: number;
     worst_performer_path: string | null;
@@ -1069,7 +1100,10 @@ export interface HealthTrendResponse {
     doc_drift_count?: number | null;
   }>;
   summary: {
-    /** `null` under a narrowed scope: only the average covers both populations. */
+    /**
+     * `null` under a narrowed scope (only the average covers both populations),
+     * and on the full scope when the newest snapshot recorded no hotspot files.
+     */
     current_hotspot_health: number | null;
     current_average_health: number;
     previous_hotspot_health: number | null;

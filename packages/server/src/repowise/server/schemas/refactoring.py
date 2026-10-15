@@ -45,6 +45,8 @@ class RefactoringOpportunitiesResponse(BaseModel):
     hidden: RefactoringHiddenCounts | None = None
     #: The plans' count vocabulary over the open inventory (``queue.counts``).
     counts: QueueCounts | None = None
+    #: Open opportunities a language gate held back, by language.
+    gated: dict[str, dict[str, Any]] | None = None
 
 
 class RefactoringRollupResponse(BaseModel):
@@ -100,6 +102,8 @@ class RefactoringOpportunityDetailResponse(BaseModel):
     plans: list[dict[str, Any]] | None = None
     #: Present when a step names a symbol an earlier step moves.
     ordering_note: str | None = None
+    #: The measurement note on a language refactoring is served as a preview on.
+    preview: str | None = None
 
 
 # Plan-level shapes: the plan lists, one plan, triage bodies and code generation.
@@ -144,6 +148,8 @@ class RefactoringPlanResponse(BaseModel):
     file_nloc: int = 0
     file_weighted_deficit: int = 0
     validation: dict[str, Any] = Field(default_factory=dict)
+    #: The measurement note on a language refactoring is served as a preview on.
+    preview: str | None = None
 
 
 class PlanRiskResponse(BaseModel):
@@ -218,6 +224,8 @@ class RefactoringSummary(BaseModel):
 class RefactoringTargetsResponse(BaseModel):
     summary: RefactoringSummary
     plans: list[RefactoringPlanResponse]
+    #: Open plans a language gate held back, by language.
+    gated: dict[str, dict[str, Any]] = {}
 
 
 class RefactoringSettings(BaseModel):

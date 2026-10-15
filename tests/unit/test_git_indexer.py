@@ -489,8 +489,10 @@ class TestGitWindowAnchor:
 
 
 class TestFixCommitClassifier:
-    """``is_fix_commit`` must agree byte-for-byte with the benchmark's
-    ``lib/defect_counter.find_fix_commits`` keyword rule (product == benchmark)."""
+    """``is_fix_commit`` must agree with the benchmark's
+    ``lib/defect_counter.find_fix_commits`` keyword rule (product == benchmark),
+    including verb inflections ("fixed", "fixes", "fixing") and compounds
+    ("hotfix", "bugfix")."""
 
     def test_include_patterns_match(self) -> None:
         from repowise.core.ingestion.git_indexer._constants import is_fix_commit
@@ -501,6 +503,12 @@ class TestFixCommitClassifier:
         assert is_fix_commit("closes #123")
         assert is_fix_commit("fixes #99 regression")
         assert is_fix_commit("squash a nasty bug")
+        assert is_fix_commit("Fixed #36012 -- Made QuerySet.update() respect ...")
+        assert is_fix_commit("Fixes crash when config is empty")
+        assert is_fix_commit("Fixing race in worker shutdown")
+        assert is_fix_commit("Fixed a crash in the pager")
+        assert is_fix_commit("hotfix: restore login")
+        assert is_fix_commit("bugfix: off-by-one in pager")
 
     def test_exclude_overrides_include(self) -> None:
         from repowise.core.ingestion.git_indexer._constants import is_fix_commit
@@ -511,12 +519,21 @@ class TestFixCommitClassifier:
         assert not is_fix_commit("Merge fix branch")
         assert not is_fix_commit("bump deps to fix CVE")
         assert not is_fix_commit("fix a typo")
+        assert not is_fix_commit("Fixed typo in docs")
+        assert not is_fix_commit("Fixes lint")
+        assert not is_fix_commit("Fixing formatting in docs")
 
     def test_non_fixes_silent(self) -> None:
         from repowise.core.ingestion.git_indexer._constants import is_fix_commit
 
         assert not is_fix_commit("feat: add new endpoint")
         assert not is_fix_commit("refactor the walker")
+        assert not is_fix_commit("affixed the label")
+        assert not is_fix_commit("fixture update")
+        assert not is_fix_commit("prefix with namespace")
+        assert not is_fix_commit("postfix expression")
+        assert not is_fix_commit("prefixed #123")
+        assert not is_fix_commit("affixed #123")
         assert not is_fix_commit("")
 
 
@@ -1285,3 +1302,45 @@ class TestCoChangeCommitWidth:
         assert partner["frequency"] == 2
         assert partner["self_commits"] == 11  # 2 shared + 9 alone
         assert partner["partner_commits"] == 2
+
+    def test_the_focused_count_leaves_out_sweep_commits(self) -> None:
+        """A sweep is still a commit of every file it touches, and still a
+        shared commit, but not one the focused count holds as evidence."""
+        import time
+
+        from repowise.core.ingestion.git_indexer._constants import (
+            _MAX_FILES_PER_COMMIT_FOR_ENTROPY,
+        )
+
+        now = int(time.time())
+        sweep = ("a.py", "b.py", *(f"s{i}.py" for i in range(_MAX_FILES_PER_COMMIT_FOR_ENTROPY)))
+        mock_repo = MagicMock()
+        mock_repo.git.log.return_value = self._log(now, ("a.py", "b.py"), sweep, sweep)
+
+        result = compute_co_changes_and_entropy(mock_repo, set(sweep), commit_limit=500)
+
+        partner = next(p for p in result.partners["a.py"] if p["file_path"] == "b.py")
+        assert partner["frequency"] == 3
+        assert partner["focused_frequency"] == 1
+        assert partner["self_commits"] == 3
+
+    def test_the_sweep_cap_is_inclusive(self) -> None:
+        """A commit of exactly the cap is focused; one file more is a sweep."""
+        import time
+
+        from repowise.core.ingestion.git_indexer._constants import (
+            _MAX_FILES_PER_COMMIT_FOR_ENTROPY as CAP,
+        )
+
+        now = int(time.time())
+        at_cap = ("a.py", "b.py", *(f"s{i}.py" for i in range(CAP - 2)))
+        over_cap = (*at_cap, "extra.py")
+        assert (len(at_cap), len(over_cap)) == (CAP, CAP + 1)
+        mock_repo = MagicMock()
+        mock_repo.git.log.return_value = self._log(now, at_cap, over_cap)
+
+        result = compute_co_changes_and_entropy(mock_repo, set(over_cap), commit_limit=500)
+
+        partner = next(p for p in result.partners["a.py"] if p["file_path"] == "b.py")
+        assert partner["frequency"] == 2
+        assert partner["focused_frequency"] == 1

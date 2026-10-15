@@ -521,6 +521,7 @@ Conformance and the cycle finder answer *per-relationship* questions (is this ed
 Workspace init registers the MCP server with your editors (skip with `--no-editor-setup`). The MCP server is workspace-aware:
 
 - **Default repo context**, queries go to the primary repo unless you specify otherwise
+- **Target routing**, `get_context`, `get_symbol`, `get_risk` and `get_health` send a path that only another repo has to that repo, and accept `<alias>:<path>` targets ([details](../agent/MCP_TOOLS.md#workspace-mode))
 - **Cross-repo context**, single-repo tools add co-change and contract evidence from the other repos
 - **Repo parameter**, most tools accept an optional `repo` parameter to target a specific repo. Four also accept `"all"` to query across the workspace: `get_overview` (the cross-repo topology), `search_codebase` (results from every repo), `get_dead_code` (findings from every repo) and `get_why` with a query (decisions from every repo). The other tools answer about one repo at a time; see [MCP_TOOLS.md](../agent/MCP_TOOLS.md#workspace-mode)
 - **Opt-in workspace tools**, off by default and enabled with `mcp.tools` in `.repowise/config.yaml`: `get_blast_radius` ([Cross-Repo Blast Radius](#cross-repo-blast-radius)), `get_conformance` ([Architecture Conformance](#architecture-conformance)) and `get_architecture` ([Architecture Metrics](#architecture-metrics))
@@ -540,6 +541,8 @@ my-workspace/
     system_graph.json              # Service-granular system graph + diagnostics
     breaking_changes.json          # Breaking provider changes vs the last index
     conformance.json               # Architecture rule violations + dependency cycles
+    workspace.db                   # Workspace store: symbol and path index, components,
+                                   # recent changes, per-repo health and freshness
   .claude/
     CLAUDE.md                      # Workspace-level CLAUDE.md for AI editors
   backend/
@@ -547,6 +550,8 @@ my-workspace/
   frontend/
     .repowise/
 ```
+
+`workspace.db` is derived from each repo's own index and refreshed after every workspace update and whenever a repo is re-indexed, so deleting it is always safe: it is rebuilt the next time it is needed.
 
 What lives in each repo's `.repowise/` is described in
 [CONFIG.md](../reference/CONFIG.md#the-repowise-directory).
