@@ -505,11 +505,13 @@ def freshness_from_repo(
         return {}
     out: dict[str, Any] = {"contract_version": MCP_CONTRACT_VERSION} if full_meta() else {}
 
-    updated_at = getattr(repository, "updated_at", None)
+    # Deferred: this module's top-level imports stay free of the ORM.
+    from repowise.core.persistence.crud import index_synced_at
+
+    synced_at = index_synced_at(repository)
     age_days: int | None = None
-    if isinstance(updated_at, datetime):
-        ua = updated_at if updated_at.tzinfo else updated_at.replace(tzinfo=UTC)
-        age_days = max(0, (datetime.now(UTC) - ua).days)
+    if synced_at is not None:
+        age_days = max(0, (datetime.now(UTC) - synced_at).days)
         out["index_age_days"] = age_days
 
     # ``root``: the served checkout (see served_root), resolved here when omitted.
@@ -854,8 +856,8 @@ def keyless_note_meta() -> dict[str, Any]:
     _state._keyless_note_announced = True
     return {
         "keyless_note": (
-            "repowise generate writes synthesized answers with a model "
-            "(needs a key, or --provider ollama for a local model)"
+            "no model is configured, so answers are not synthesized; set a provider "
+            "key (or a provider in .repowise/config.yaml) and restart the MCP server"
         )
     }
 

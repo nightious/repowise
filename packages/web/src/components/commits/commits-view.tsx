@@ -133,13 +133,13 @@ export async function CommitsView({
         </OverviewSection>
       )}
 
-      {trend && trend.enabled && trend.agent_commits > 0 && <AgentTrendStrip trend={trend} />}
+      {trend && <AgentTrendStrip trend={trend} />}
 
       <OverviewSection
         title={t("scoreBehaviourTitle")}
         description={t("scoreBehaviourDescription")}
         action={
-          <SectionLink href={`${base}/code-health?tab=triage`} LinkComponent={Link}>
+          <SectionLink href={`${base}/code-health?tab=map`} LinkComponent={Link}>
             {t("changeRisk")}
           </SectionLink>
         }

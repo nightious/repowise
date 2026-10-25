@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import re
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
 
 import click
@@ -14,20 +15,30 @@ from rich.table import Table
 
 from repowise.cli.helpers import console, get_db_url_for_repo
 from repowise.cli.output import emit_json, emit_refusal
+from repowise.core.agents.identity import is_agent_slug
+from repowise.core.analysis.decisions.lifecycle import ACCEPTER_SESSION_MAX
 
 
 @asynccontextmanager
 async def _open_store(repo_path: Path):
     """Yield a session factory on the repo's store; the engine is disposed after.
 
-    A factory, so ``add`` can embed after its session commits.
+    A factory, so ``add`` can embed after its session commits. A locked or
+    unreadable store is reported as one line, not a SQL traceback.
     """
+    from sqlalchemy.exc import OperationalError
+
     from repowise.core.persistence import create_engine, create_session_factory, init_db
 
     engine = create_engine(get_db_url_for_repo(repo_path))
     try:
         await init_db(engine)
         yield create_session_factory(engine)
+    except OperationalError as exc:
+        raise click.ClickException(
+            f"Could not use the index at {repo_path}: {exc.orig}. "
+            "If `repowise update` is running, retry once it finishes."
+        ) from exc
     finally:
         await engine.dispose()
 
@@ -97,15 +108,27 @@ class _PreviewRollbackError(Exception):
 _ID_SHAPED = re.compile(r"[0-9a-fA-F]{4,64}\Z")
 
 
+def _require_ids(ids: list[str], verb: str, fmt: str) -> None:
+    """Refuse a run that names no decision, pointing at where ids come from."""
+    if not ids:
+        emit_refusal(
+            "no_decision_ids",
+            f"Name the decision ids to {verb}.",
+            fmt,
+            remedy="List candidates and their ids with `repowise decision candidates`.",
+        )
+
+
 def _split_ids_and_path(tokens: tuple[str, ...]) -> tuple[list[str], str | None]:
     """Separate decision ids from the optional trailing repo path.
 
     ``confirm ID [PATH]`` shipped before batch arity, so the path is still a
     positional. An id-shaped last token stays an id even when a directory of
     that name happens to exist, because reading one as a path would drop it
-    from the batch and still exit 0.
+    from the batch and still exit 0. A lone directory is the path, so
+    ``confirm .`` reports that no id was named rather than an unknown id.
     """
-    last = tokens[-1] if len(tokens) > 1 else ""
+    last = tokens[-1] if tokens else ""
     # An empty token would otherwise read as the current directory.
     if last and not _ID_SHAPED.match(last) and Path(last).is_dir():
         return list(tokens[:-1]), last
@@ -250,3 +273,57 @@ def _emit_single(result: dict, token: str, verb: str, fmt: str, note: str, remed
     emit_refusal(
         result["error"], f"Cannot {verb} {result['id'][:8]}: {result['message']}", fmt, **extra
     )
+
+
+@dataclass(frozen=True)
+class _Signer:
+    """Who signs an acceptance-log row: an agent by slug, or the repository's person."""
+
+    agent: str
+    kind: str
+    session: str
+
+    def name(self, repo_path: Path, override: str = "") -> str:
+        from repowise.core.analysis.decisions.accepter import resolve_accepter
+
+        return self.agent or resolve_accepter(repo_path, override=override)
+
+
+def _signer(agent: str, agent_session: str, *, accepter: str = "") -> _Signer:
+    """Validate the signing flags and return who they sign as.
+
+    Shared by every verb that appends to the acceptance log, so an agent can
+    say it is one wherever it can act.
+    """
+    _check_agent_flag(agent, accepter)
+    _check_session_flag(agent_session, agent)
+    return _Signer(agent=agent, kind="agent" if agent else "person", session=agent_session)
+
+
+def _check_agent_flag(agent: str, accepter: str) -> None:
+    if agent and accepter:
+        raise click.ClickException("Pass --agent or --as, not both: they name different signers.")
+    if agent and not is_agent_slug(agent):
+        raise click.ClickException(
+            f"{agent!r} is not a well-formed agent slug (lowercase, digits and underscores)."
+        )
+
+
+def _check_session_flag(agent_session: str, agent: str) -> None:
+    if agent_session and not agent:
+        raise click.ClickException("--session names the agent signing; pass --agent too.")
+    if len(agent_session) > ACCEPTER_SESSION_MAX:
+        raise click.ClickException(f"--session is at most {ACCEPTER_SESSION_MAX} characters.")
+
+
+#: The two flags an agent signs with, on every verb that writes an authority
+#: row: withdrawing needs no switch, so it is the likeliest to go unsigned.
+def _signing_options(command):
+    command = click.option(
+        "--session", "agent_session", default="", help="The agent session signing."
+    )(command)
+    return click.option(
+        "--agent",
+        default="",
+        help="Sign as this agent (e.g. claude_code) rather than as a person.",
+    )(command)

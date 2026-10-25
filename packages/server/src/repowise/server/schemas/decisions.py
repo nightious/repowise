@@ -71,6 +71,9 @@ class DecisionRecordResponse(BaseModel):
     accepter: str | None = None
     accepter_kind: str | None = None
     accepter_session: str | None = None
+    # Why a record just created stayed a candidate, in the acceptance
+    # contract's words. Set by the create route only.
+    blockers: list[str] | None = None
 
     @classmethod
     def from_orm(cls, obj: object) -> DecisionRecordResponse:
@@ -349,9 +352,9 @@ class DecisionSettings(BaseModel):
     #: default | off | local_only | balanced | full | custom
     preset: str = "default"
     #: Whether an agent may grant a decision authority, as against withdrawing
-    #: it. False is the shipped posture, so a settings form that omits this
-    #: field is reporting the default rather than hiding a grant.
-    agent_acceptance: bool = False
+    #: it. True is the shipped posture; every agent grant is signed as the
+    #: agent's, so a person-only gate is the opt-out.
+    agent_acceptance: bool = True
     discovery: DecisionDiscoveryBudget = DecisionDiscoveryBudget()
     sources: list[DecisionSourceState] = []
     provider_available: bool = True

@@ -199,6 +199,8 @@ _BIOMARKER_CATEGORY: dict[str, str] = {
     "dry_violation": "duplication",
     "untested_hotspot": "test_coverage",
     "coverage_gap": "test_coverage",
+    # Advisory (deducts nothing); filed with the coverage markers it explains.
+    "untested_complexity": "test_coverage",
     "coverage_gradient": "test_coverage_gradient",
     "developer_congestion": "organizational",
     "knowledge_loss": "organizational",
@@ -222,6 +224,13 @@ _BIOMARKER_CATEGORY: dict[str, str] = {
     "ungoverned_hotspot": "organizational",
     "stale_governance": "organizational",
     "contradictory_decision": "organizational",
+    # Advisory Apex markers; one family so grouped surfaces file them together.
+    "apex_soql_injection": "apex",
+    "apex_missing_sharing": "apex",
+    "apex_hardcoded_id": "apex",
+    "apex_see_all_data": "apex",
+    # Advisory COBOL marker.
+    "cobol_unstructured_flow": "cobol",
 }
 
 
@@ -324,6 +333,17 @@ _BIOMARKER_DIMENSIONS: dict[str, set[str]] = {
     # Fires only beside complex_method and large_method on the same function, so
     # scoring it charged that function twice; dropping it moved no defect AUC.
     "brain_method": {ADVISORY_DIMENSION},
+    # Its two inputs already deduct: complexity through complex_method, missing
+    # coverage through coverage_gap and coverage_gradient. Uncalibrated; it ranks
+    # which complex functions most need tests rather than moving the score.
+    "untested_complexity": {ADVISORY_DIMENSION},
+    # Uncalibrated Apex markers: findings only until a defect corpus covers them.
+    "apex_soql_injection": {ADVISORY_DIMENSION},
+    "apex_missing_sharing": {ADVISORY_DIMENSION},
+    "apex_hardcoded_id": {ADVISORY_DIMENSION},
+    "apex_see_all_data": {ADVISORY_DIMENSION},
+    # Uncalibrated COBOL marker: GO TO and ALTER already add cognitive points.
+    "cobol_unstructured_flow": {ADVISORY_DIMENSION},
 }
 
 # Maintainability per-biomarker weight multipliers. Expert-set by definition -
@@ -545,7 +565,18 @@ _PERFORMANCE_HOME: frozenset[str] = frozenset(
 # The display half of the pairing above; ``test_advisory_dimension.py`` locks
 # the two together for every registered biomarker.
 _ADVISORY_HOME: frozenset[str] = frozenset(
-    {"assertion_free_test", "mock_saturated_test", "hidden_coupling", "brain_method"}
+    {
+        "assertion_free_test",
+        "mock_saturated_test",
+        "hidden_coupling",
+        "brain_method",
+        "untested_complexity",
+        "apex_soql_injection",
+        "apex_missing_sharing",
+        "apex_hardcoded_id",
+        "apex_see_all_data",
+        "cobol_unstructured_flow",
+    }
 )
 
 

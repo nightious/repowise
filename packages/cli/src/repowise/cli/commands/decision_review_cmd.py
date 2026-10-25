@@ -10,6 +10,7 @@ from __future__ import annotations
 import click
 from rich.table import Table
 
+from repowise.cli.commands.decision_batch import _signer, _signing_options
 from repowise.cli.helpers import console, get_db_url_for_repo, run_async
 from repowise.cli.output import emit_json, emit_refusal, format_option, notice_console
 
@@ -204,15 +205,26 @@ def candidates_command(
 @click.argument("decision_id")
 @click.argument("into_id")
 @click.argument("path", required=False, default=None)
+@_signing_options
 @format_option()
-def merge_command(decision_id: str, into_id: str, path: str | None, fmt: str) -> None:
-    """Fold a candidate into an existing decision instead of accepting a duplicate."""
-    from repowise.cli.commands.decision_cmd import _resolve_decision_id, _resolve_decision_repo
+def merge_command(
+    decision_id: str, into_id: str, path: str | None, agent: str, agent_session: str, fmt: str
+) -> None:
+    """Fold a candidate into an existing decision instead of accepting a duplicate.
 
+    ``--agent`` signs the merge as that agent, like ``decision confirm``.
+    """
+    from repowise.cli.commands.decision_cmd import (
+        _load_policy,
+        _resolve_decision_id,
+        _resolve_decision_repo,
+    )
+
+    signer = _signer(agent, agent_session)
     repo_path = _resolve_decision_repo(path, fmt)
+    granted = _load_policy(repo_path).agent_acceptance if agent else False
 
     async def _run():
-        from repowise.core.analysis.decisions.accepter import resolve_accepter
         from repowise.core.persistence import get_session
         from repowise.core.persistence.crud.authority import merge_candidate
         from repowise.core.persistence.models import DecisionRecord
@@ -229,7 +241,13 @@ def merge_command(decision_id: str, into_id: str, path: str | None, fmt: str) ->
                 rec = await session.get(DecisionRecord, src)
                 try:
                     await merge_candidate(
-                        session, rec, into_id=dst, accepter=resolve_accepter(repo_path)
+                        session,
+                        rec,
+                        into_id=dst,
+                        accepter=signer.name(repo_path),
+                        kind=signer.kind,
+                        accepter_session=signer.session,
+                        agent_acceptance=granted,
                     )
                 except ValueError as exc:
                     emit_refusal("merge_refused", str(exc), fmt, decision_id=src)
@@ -282,7 +300,11 @@ def dedupe_command(
     and every folded id keeps resolving.
     """
     from repowise.cli.commands.decision_cmd import _resolve_decision_repo
-    from repowise.cli.providers.embedders import build_embedder, resolve_embedder_for_repo
+    from repowise.cli.providers.embedders import (
+        build_embedder,
+        resolve_embedder_for_repo,
+        semantic_search_command,
+    )
     from repowise.cli.providers.vector_store import build_vector_store
     from repowise.core.analysis.decisions.semantic_match import DEFAULT_DEDUP_TAU
     from repowise.core.providers.embedding.base import MockEmbedder
@@ -298,7 +320,7 @@ def dedupe_command(
             "no_real_embedder",
             "Decisions can only be compared with a real embedder, not test vectors.",
             fmt,
-            remedy="Set an embedder key and run 'repowise reindex'.",
+            remedy=f"Run '{semantic_search_command(repo_path)}'.",
         )
     vector_store = build_vector_store(repo_path, embedder)
     if vector_store is None:
@@ -306,7 +328,7 @@ def dedupe_command(
             "no_vector_store",
             "This repo has no vector store to compare decisions with.",
             fmt,
-            remedy="Set an embedder key and run 'repowise reindex'.",
+            remedy=f"Run '{semantic_search_command(repo_path)}'.",
         )
 
     async def _run():

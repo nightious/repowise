@@ -11,6 +11,7 @@ import contextlib
 import multiprocessing
 import os
 import time
+from collections import Counter
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,7 +19,7 @@ from typing import Any
 
 import structlog
 
-from repowise.core.pipeline.progress import ProgressCallback, emit_warning
+from repowise.core.pipeline.progress import ProgressCallback, emit_item, emit_warning
 
 from ._common import _phase_done
 
@@ -38,21 +39,34 @@ def _report_missing_grammars(stats: Any, progress: ProgressCallback | None) -> N
     if not lang_counts:
         return
     try:
-        from repowise.core.ingestion.parser import missing_grammar_languages
+        from repowise.core.ingestion.languages.registry import REGISTRY
+        from repowise.core.ingestion.parser import (
+            missing_grammar_languages,
+            unavailable_runtime_grammars,
+        )
 
         missing = missing_grammar_languages(lang_counts)
+        unavailable = unavailable_runtime_grammars(lang_counts)
     except Exception:
         logger.debug("grammar_preflight_failed", exc_info=True)
         return
-    if not missing:
-        return
-    detail = ", ".join(f"{lang} ({lang_counts[lang]:,} files)" for lang in missing)
-    emit_warning(
-        progress,
-        f"No parser installed for: {detail}. "
-        "These files are indexed but contribute no symbols; "
-        "reinstall repowise to pick up the missing grammars.",
-    )
+    if missing:
+        detail = ", ".join(f"{lang} ({lang_counts[lang]:,} files)" for lang in missing)
+        emit_warning(
+            progress,
+            f"No parser installed for: {detail}. "
+            "These files are indexed but contribute no symbols; "
+            "reinstall repowise to pick up the missing grammars.",
+        )
+    for lang, reason in unavailable:
+        spec = REGISTRY.get(lang)
+        emit_warning(
+            progress,
+            f"{spec.display_name if spec else lang} grammar unavailable: "
+            f"{lang_counts[lang]:,} files indexed without symbols ({reason}). "
+            "It downloads on first use; on a machine with no network, set "
+            "REPOWISE_GRAMMAR_DIR to a pre-staged grammar cache.",
+        )
 
 
 def _report_query_compilation_failures(stats: Any, progress: ProgressCallback | None) -> None:
@@ -86,37 +100,42 @@ def _report_query_compilation_failures(stats: Any, progress: ProgressCallback | 
         return
 
 
-async def _timed_step(
-    label: str,
-    fn: Any,
+async def _run_concurrent_steps(
+    phase: str,
+    steps: list[tuple[str, Any]],
     progress: ProgressCallback | None,
-) -> Any:
-    """Run *fn* in a worker thread and emit a per-step completion line.
+) -> None:
+    """Run each ``(label, fn)`` in a worker thread at once, as one counted phase.
 
-    Used to make ``asyncio.gather`` of multiple graph-algorithm calls
-    legible: without this, four concurrent thread-bound computations
-    (e.g. PageRank + betweenness + symbol PageRank + symbol betweenness)
-    appear in the CLI as one opaque several-minute spinner, so the user
-    has no signal as to which step is the bottleneck. With it, each algo
-    prints `  ↳ <label> ✓ (Xs)` as it finishes — completion order
-    surfaces the relative cost without changing the underlying execution.
+    The running row's count advances as each finishes and its current item
+    names the ones still running, so a long kernel (symbol betweenness on a
+    big repo) is visibly the one holding the step. Per-step times go to the
+    log rather than the screen: one done row per phase, no extra lines.
     """
-    t0 = time.monotonic()
-    try:
-        result = await asyncio.to_thread(fn)
-    except Exception as exc:
-        if progress is not None:
-            progress.on_message(
-                "warning",
-                f"  ↳ {label} failed after {time.monotonic() - t0:.1f}s: {exc}",
-            )
-        raise
-    if progress is not None:
-        progress.on_message(
-            "info",
-            f"  ↳ {label} ✓ ({time.monotonic() - t0:.1f}s)",
-        )
-    return result
+    running = [label for label, _ in steps]
+    if progress:
+        progress.on_phase_start(phase, len(steps))
+    emit_item(progress, phase, ", ".join(running))
+
+    async def _one(label: str, fn: Any) -> None:
+        t0 = time.monotonic()
+        try:
+            await asyncio.to_thread(fn)
+        except Exception as exc:
+            if progress is not None:
+                progress.on_message(
+                    "warning",
+                    f"  {label} failed after {time.monotonic() - t0:.1f}s: {exc}",
+                )
+            raise
+        logger.info("graph_step_done", step=label, seconds=round(time.monotonic() - t0, 1))
+        running.remove(label)
+        if progress:
+            progress.on_item_done(phase)
+        emit_item(progress, phase, ", ".join(running))
+
+    await asyncio.gather(*(_one(label, fn) for label, fn in steps))
+    _phase_done(progress, phase)
 
 
 # Traversal skip counters, in report order: (stat attribute, how to describe it).
@@ -134,6 +153,7 @@ _SKIP_REASONS: tuple[tuple[str, str], ...] = (
     ("skipped_submodule", "submodule dirs"),
     ("skipped_nested_repo", "nested git repos"),
     ("skipped_unknown_language", "unknown type"),
+    ("skipped_repowise_output", "written by repowise"),
 )
 
 _TOP_LANGUAGES_SHOWN = 6
@@ -319,6 +339,9 @@ def _parse_one(path_and_fi_and_bytes: tuple) -> Any:
     try:
         if _WORKER_PARSER is None:
             from repowise.core.ingestion import ASTParser
+            from repowise.core.worker_logging import quiet_worker_logs
+
+            quiet_worker_logs()
 
             _WORKER_PARSER = ASTParser()
         return _WORKER_PARSER.parse_file(fi, source)
@@ -493,7 +516,10 @@ async def _traverse_stage(
         repo_path, traverser, allow_formatter_check=walk.derive_environment_facts
     )
     _phase_done(progress, "traverse")
-    return traverser, _filter_file_infos(file_infos, walk), repo_structure
+    file_infos = _filter_file_infos(file_infos, walk)
+    # The threaded walk skips ``traverse()``, which is what counts languages.
+    traverser.stats.lang_counts = dict(Counter(f.language for f in file_infos))
+    return traverser, file_infos, repo_structure
 
 
 async def _parse_in_pool(
@@ -507,9 +533,16 @@ async def _parse_in_pool(
         # until the last file is done, which on large repos looked like a hang
         # at ``0/N``. Done-callbacks keep gather's ordered results intact.
         if progress is not None:
-            _parse_tick = lambda _fut: progress.on_item_done("parse")  # noqa: E731
-            for fut in tasks:
-                fut.add_done_callback(_parse_tick)
+
+            def _parse_tick(path: str) -> Any:
+                def _tick(_fut: Any) -> None:
+                    progress.on_item_done("parse")
+                    emit_item(progress, "parse", path)
+
+                return _tick
+
+            for fut, (_idx, (fi, _src), _h) in zip(tasks, to_parse, strict=True):
+                fut.add_done_callback(_parse_tick(fi.path))
         return await asyncio.gather(*tasks, return_exceptions=True)
 
 
@@ -526,6 +559,7 @@ async def _parse_in_process(to_parse: list[tuple], progress: ProgressCallback | 
             parse_results.append((fi.abs_path, str(exc)))
         if progress:
             progress.on_item_done("parse")
+            emit_item(progress, "parse", fi.path)
         if i % 50 == 49:
             await asyncio.sleep(0)
     return parse_results
@@ -704,7 +738,7 @@ async def _build_graph(
         # because on a small repo the build is over in under a second.
         progress.on_message(
             "notice",
-            "Graph build can take several minutes on a first run. Safe to Ctrl-C — "
+            "Graph build can take several minutes on a first run. Safe to Ctrl-C: "
             "re-run 'repowise init --resume' to continue where it stopped.",
         )
     await asyncio.to_thread(graph_builder.build, progress)
@@ -773,26 +807,27 @@ async def _prime_graph_metrics(graph_builder: Any, progress: ProgressCallback | 
 
     Otherwise they run lazily inside persist and generation behind opaque
     bars. Within a phase the kernels overlap via ``asyncio.gather`` so
-    betweenness (the dominant cost) runs alongside the rest, and each is
-    wrapped in ``_timed_step`` so its completion line names the bottleneck.
+    betweenness (the dominant cost) runs alongside the rest, and the
+    running row names the kernels still going, so it names the bottleneck.
     """
-    if progress:
-        progress.on_phase_start("graph.metrics", None)
-    await asyncio.gather(
-        _timed_step("PageRank", graph_builder.pagerank, progress),
-        _timed_step("betweenness centrality", graph_builder.betweenness_centrality, progress),
-        _timed_step("symbol PageRank", graph_builder.symbol_pagerank, progress),
-        _timed_step("symbol betweenness", graph_builder.symbol_betweenness_centrality, progress),
+    await _run_concurrent_steps(
+        "graph.metrics",
+        [
+            ("PageRank", graph_builder.pagerank),
+            ("betweenness centrality", graph_builder.betweenness_centrality),
+            ("symbol PageRank", graph_builder.symbol_pagerank),
+            ("symbol betweenness", graph_builder.symbol_betweenness_centrality),
+        ],
+        progress,
     )
-    _phase_done(progress, "graph.metrics")
-
-    if progress:
-        progress.on_phase_start("graph.communities", None)
-    await asyncio.gather(
-        _timed_step("community detection", graph_builder.community_detection, progress),
-        _timed_step("symbol communities", graph_builder.symbol_communities, progress),
+    await _run_concurrent_steps(
+        "graph.communities",
+        [
+            ("community detection", graph_builder.community_detection),
+            ("symbol communities", graph_builder.symbol_communities),
+        ],
+        progress,
     )
-    _phase_done(progress, "graph.communities")
 
 
 async def _run_ingestion(

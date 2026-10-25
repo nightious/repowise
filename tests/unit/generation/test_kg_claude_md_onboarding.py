@@ -97,13 +97,13 @@ class TestClaudeMdKGSection:
         tmpl = jinja_env.get_template("claude_md.j2")
         data = self._data(
             key_modules=[
-                KeyModule(name="src/api", purpose="API layer", file_count=4, owner=None),
-                KeyModule(name="src/core", purpose="", file_count=9, owner=None),
+                KeyModule(name="src/api", purpose="API layer", owner=None),
+                KeyModule(name="src/core", purpose="", owner=None),
             ]
         )
         rendered = tmpl.render(data=data)
         assert "### Key modules" in rendered
-        assert "- `src/api` — API layer" in rendered
+        assert "- `src/api`: API layer" in rendered
         # No purpose → no dangling separator.
         assert "- `src/core`\n" in rendered
 

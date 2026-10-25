@@ -6,8 +6,8 @@ you make in coding-agent sessions. Each record is tied to the files it governs,
 backed by a verbatim quote, checked for staleness against the code, and handed
 to your agent when it is about to edit those files.
 
-It does not decide anything for you. A machine can propose a candidate; only a
-person (or a committed ADR) makes it a decision that governs.
+It does not decide anything for you. Extraction only proposes candidates; a
+person, a signed agent, or a committed ADR makes one a decision that governs.
 
 Cost: capture runs inside `repowise init` and `repowise update`. ADR files,
 inline markers, manual entry and conventions need no LLM key. Commit, pull
@@ -51,12 +51,13 @@ its source, a confidence, a staleness score, and one or more evidence rows
 
 Acceptance is a recorded event, not a status flag. It carries a reason, a
 scope, an evidence reference and who signed it, and Repowise refuses to store
-an acceptance that is missing any of those:
+an acceptance that is missing any of those. A record with no decision text, mined
+or typed, is refused too; `confirm --decision` supplies it:
 
 ```
 $ repowise decision confirm 4b6ddc58
 Cannot accept 4b6ddc58: no scope: name the files or modules it governs
-Supply the missing parts with --reason, --scope or --evidence.
+Supply the missing parts with --decision, --reason, --scope or --evidence.
 
 $ repowise decision confirm 4b6ddc58 --scope src/ingestion
 Decision 4b6ddc58 accepted (governing)
@@ -109,10 +110,11 @@ on every read. `superseded` and `dismissed` are set by a person.
 
 - Staleness score: each record carries `staleness_score` between 0 and 1, the
   fraction of its governed files committed to since the decision was recorded.
-  A file the repository does not track counts as changed. At 0.5 or above a
-  record is stale for `decision list --stale-only`, the health summary and the
-  `needs_review` currency. A record that names no file scores 0.0 and is
-  counted separately as unscoped. `repowise decision show` and `get_why` on a
+  A record written before its evidence commits landed counts from the commit
+  (or squash) that landed them. A file the repository does not track counts
+  as changed. At 0.5 or above a record is stale for `decision list --stale-only`,
+  the health summary and the `needs_review` currency. A record that names no
+  file scores 0.0 and is counted separately as unscoped. `repowise decision show` and `get_why` on a
   path also ask git directly for one record and print what changed.
 - Sticky review: a dismissed candidate is kept as a tombstone, so re-indexing
   never proposes it again. A later extraction never walks an accepted decision
@@ -157,6 +159,7 @@ repowise decision add --title T --decision D [--affects PATH ...]   # no prompts
 | `--affects`, `--tag` | A file or module it governs; a tag. Repeatable |
 | `--evidence-commit` | A commit the decision was made in. Repeatable |
 | `--kind` | `architectural` (default) or `agreement` |
+| `--agent`, `--session` | Record it as this agent's (source `agent`), with its session id. Needs the flags |
 | `--format json` | Machine-readable output with the full id |
 
 What gets stored depends on how you add it:
@@ -167,6 +170,12 @@ What gets stored depends on how you add it:
 - Flags (`--title` and `--decision`) store a candidate (`proposed`). A person
   answering the prompts has reviewed the decision; a script or agent inferring
   one has not. Promote it with `repowise decision confirm ID`.
+- After a commit whose message states a choice, a hook asks the agent once a
+  session to record it with `decision add`. On by default;
+  `repowise decision config capture-prompt --off` turns it off.
+- `--agent SLUG` marks a candidate an agent reasoned out itself. Unlike a
+  person's manual entry, accepting it needs an evidence reference
+  (`--evidence-commit` on add, or `--evidence` on confirm).
 - `--kind agreement` records a rule about how the work is done ("never push
   without review"). It governs the whole repository, needs no files, and
   reaches an agent at session start.
@@ -177,13 +186,16 @@ What gets stored depends on how you add it:
 
 Each acceptance records who signed it and what kind of signer: `person`,
 `agent`, or `import` (the committed manifest or an ADR). The person defaults to
-`git config user.name`; `--as` records a different identity. An agent may
-withdraw authority (`dismiss`, `deprecate`) by signing as itself with
-`--agent SLUG`. Granting authority is refused for an agent unless the
-repository allows it with `repowise decision config agent-acceptance --on` (off
-by default); the agent then signs with, for example,
-`decision confirm ID --agent claude_code --session "$SESSION_ID"`. The dashboard badges any authority record a person did not sign, and
+`git config user.name`; `--as` records a different identity. An agent reviews
+and accepts by signing as itself, for example
+`decision confirm ID --agent claude_code --session "$SESSION_ID"`; `merge`,
+`dismiss` and `deprecate` take `--agent` too. The acceptance contract is the
+same for every signer, and an agent's own record also needs evidence. The
+dashboard badges any authority record a person did not sign, the generated
+`CLAUDE.md` marks it `[accepted by SLUG, not a person]`, and
 `decision show --format json` returns the signature.
+`repowise decision config agent-acceptance --off` keeps granting to people:
+agents still propose and withdraw.
 
 ### The tracked manifest
 

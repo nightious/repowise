@@ -147,12 +147,19 @@ def test_keyless_index_gets_keyless_steering(any_gen):
     assert _KEYLESS_BULLET in result
     # Template pages store confidence 1.0, so the figure would read as 100%.
     assert "Confidence:" not in result
-    assert "(commit a1b2c3d).\nScope: no model (template prose, full-text search)." in result
-    # `--full` needs a key; offering it to a keyless index is a dead end.
+    assert "(commit a1b2c3d).\nScope: Built from code (no model, full-text search)." in result
+    # A built-from-code index is already full: `--full` has nothing to add.
     assert "repowise update --full" not in result
     assert "[fts]` only has no semantic agreement" not in result
     assert 'Cite `confidence: "high"`' not in result
     assert "`degraded` means no prose; `confidence` rates the evidence" in result
+    assert "provider key and `repowise generate`" in result
+
+
+def test_index_only_keyless_names_the_fast_to_full_command(any_gen):
+    result = any_gen.render(_scoped({**_KEYLESS_SCOPE, "content_provenance": "none"}))
+    assert "provider key and `repowise update --full`" in result
+    assert "Scope: Index only (no documentation, full-text search)." in result
 
 
 def test_keyed_index_keeps_model_guidance(any_gen):
@@ -405,6 +412,47 @@ def test_write_replaces_between_markers(gen, tmp_path):
     assert "test-repo" in new_content  # new managed content present
 
 
+@pytest.mark.parametrize("title", [r"C:\Users\x", r"C:\new\tools", r"\1", r"\g<0>"])
+@pytest.mark.parametrize("existing_kind", ["marked", "unmarked", "absent"])
+@pytest.mark.parametrize("method", ["write", "render_full"])
+def test_managed_rewrite_preserves_literal_backslashes(
+    any_gen, tmp_path, title, existing_kind, method
+):
+    from dataclasses import replace
+
+    from repowise.core.generation.editor_files.data import DecisionSummary
+
+    data = replace(
+        _minimal_data(),
+        decisions=[DecisionSummary(title=title, status="active", rationale="Keep literal text.")],
+    )
+    start = any_gen.MARKER_START_FMT.format(tag=any_gen.marker_tag)
+    end = any_gen.MARKER_END_FMT.format(tag=any_gen.marker_tag)
+    prefix = "# User notes\nKeep this.\n\n"
+    suffix = "\n\nUser footer.\n"
+    target = tmp_path / any_gen.filename
+    rendered = any_gen.render(data)
+    assert title in rendered
+    wrapped = f"{start}\n{rendered}\n{end}"
+    if existing_kind == "marked":
+        target.write_text(f"{prefix}{start}\nold managed text\n{end}{suffix}", encoding="utf-8")
+        expected = prefix + wrapped + suffix
+    elif existing_kind == "unmarked":
+        target.write_text(prefix, encoding="utf-8")
+        expected = prefix.rstrip() + "\n\n" + wrapped + "\n"
+    else:
+        expected = any_gen.user_placeholder + "\n" + wrapped + "\n"
+
+    result = getattr(any_gen, method)(tmp_path, data)
+    actual = result.read_text(encoding="utf-8") if method == "write" else result
+    assert actual == expected
+    any_gen.write(tmp_path, data)
+    assert target.read_text(encoding="utf-8") == expected
+    assert any_gen.render_full(tmp_path, data) == expected
+    any_gen.write(tmp_path, data)
+    assert target.read_text(encoding="utf-8") == expected
+
+
 def test_write_replaces_only_managed_section(gen, tmp_path):
     marker_start = gen.MARKER_START_FMT.format(tag=gen.marker_tag)
     marker_end = gen.MARKER_END_FMT.format(tag=gen.marker_tag)
@@ -475,7 +523,7 @@ def test_render_hotspot_row_leads_with_fix_history(gen):
         hotspots=[_hotspot("src/a.py", fix_count=5, bug_magnet=True, last_fix_date="2026-03-14")],
     )
     result = gen.render(data)
-    assert "5 bug fixes, last fix 2026-03-14 (bug magnet); 28 commits/90d" in result
+    assert "5 bug fixes in 6 months, last fix 2026-03-14 (bug magnet); 28 commits/90d" in result
 
 
 def test_render_hotspot_row_singularizes_one_fix(gen):
@@ -486,7 +534,7 @@ def test_render_hotspot_row_singularizes_one_fix(gen):
         hotspots=[_hotspot("src/a.py", fix_count=1, last_fix_date="2026-03-27")],
     )
     result = gen.render(data)
-    assert "1 bug fix, last fix 2026-03-27" in result
+    assert "1 bug fix in 6 months, last fix 2026-03-27" in result
     assert "1 bug fixes" not in result
 
 
@@ -497,7 +545,7 @@ def test_render_hotspot_row_falls_back_to_churn_without_fix_history(gen):
 
     data = dataclasses.replace(_minimal_data(), hotspots=[_hotspot("src/a.py")])
     result = gen.render(data)
-    assert "- `src/a.py` — 28 commits/90d" in result
+    assert "- `src/a.py`: 28 commits/90d" in result
     assert "bug fix" not in result
 
 
