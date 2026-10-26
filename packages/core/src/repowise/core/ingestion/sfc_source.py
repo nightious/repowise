@@ -673,7 +673,9 @@ _ASTRO_SCRIPT_TYPE = re.compile(rb"""(?<![\w.-])type\s*=(?!=)\s*["']?([^"'\s>]+)
 # lazy prefix steps over quoted and ``{...}`` values whole, so ``title="src=./x"``
 # is not read, and a ``{url}`` value is an expression, which no value form matches.
 # A ``{`` that does not balance is a plain byte, as in the start tag; atomic, so a
-# balanced value is never re-entered to read a ``src =`` inside it.
+# value up to two braces deep is never re-entered to read a ``src =`` inside it.
+# shortcut: in a value nested 3+ braces deep, a ``src =``, ``href =`` or ``is:raw``
+# outside the two innermost braces is read; widen the brace group once a real file does that.
 _ASTRO_ATTR_PREFIX = rb"""(?:"[^"]*"|'[^']*'|(?>%b|\{)|[^"'{])*?""" % _ASTRO_BRACE
 _ASTRO_REF = {
     tag: re.compile(
