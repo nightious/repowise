@@ -52,7 +52,7 @@ from ..parser_helpers import _collect_error_nodes, _run_query
 from ..python_local_refs import local_refs_from_tree, parse_python_module
 from ..python_registrars import registering_functions
 from ..salesforce_soql import apex_schema_refs
-from ..sfc_source import component_call_sites, extract_astro_markup_imports, prepare_source
+from ..sfc_source import component_call_sites, prepare_source, scan
 from ..special_handlers import SPECIAL_HANDLER_LANGUAGES, parse_special
 from .calls import (
     _DOTTED_PATH,
@@ -174,8 +174,6 @@ class ASTParser:
         matches = _run_query(query, root) if query is not None else []
         src = source.decode("utf-8", errors="replace")
         imports = _extract_imports(matches, config, file_info, src)
-        if lang == "astro":
-            _merge_markup_imports(imports, extract_astro_markup_imports(original_source))
         return imports + _masked_imports(lang, original_source)
 
     def parse_file(self, file_info: FileInfo, source: bytes) -> ParsedFile:
@@ -196,8 +194,9 @@ class ASTParser:
         if config is None or language is None or _is_fsharp_signature(file_info):
             return _parse_without_grammar(file_info, source, config, language, content_hash)
 
-        # An SFC (.svelte, .vue) is blanked to its script at byte-identical
-        # offsets; ``content_hash`` above keeps hashing the original bytes.
+        # An SFC (.svelte, .vue, .razor, .astro) is blanked to its script at
+        # byte-identical offsets; ``content_hash`` above keeps hashing the
+        # original bytes.
         original_source = source
         source = prepare_source(lang, source, path=file_info.path)
 
@@ -225,8 +224,6 @@ class ASTParser:
         )
         _restore_kotlin_annotations(symbols, recovered_annotations)
         imports = _extract_imports(matches, config, file_info, src)
-        if lang == "astro":
-            _merge_markup_imports(imports, extract_astro_markup_imports(original_source))
         imports.extend(_masked_imports(lang, original_source))
         calls = _extract_calls(matches, config, file_info, src, symbols)
         # An SFC's markup tags (``<Foo />``) are component calls the TS buffer lost.
@@ -264,15 +261,6 @@ class ASTParser:
                 apex_schema_refs(root, symbols, file_info.path) if lang == "apex" else []
             ),
         )
-
-
-def _merge_markup_imports(imports: list[Import], markup_imports: list[Import]) -> None:
-    """Append markup imports whose module path is not already present."""
-    seen = {imp.module_path for imp in imports}
-    for markup_imp in markup_imports:
-        if markup_imp.module_path not in seen:
-            seen.add(markup_imp.module_path)
-            imports.append(markup_imp)
 
 
 def _is_fsharp_signature(file_info: FileInfo) -> bool:
@@ -317,7 +305,28 @@ def _masked_imports(lang: str, original_source: bytes) -> list[Import]:
         from ..cobol.facts import cobol_imports
 
         return cobol_imports(original_source)
+    if lang == "astro":
+        return _astro_markup_imports(original_source)
     return []
+
+
+def _astro_markup_imports(original_source: bytes) -> list[Import]:
+    """An Astro page's markup ``<script src>`` / ``<link href>``, as imports.
+
+    Astro bundles a ``<script>`` whose only attribute is ``src`` as ``import "<src>"``,
+    so its value is kept as written, like a frontmatter import: an alias or a package
+    resolves. Any other value is a URL the browser fetches, page-relative as in HTML,
+    so a bare one (``favicon.ico``) gains ``./``.
+    """
+    from ..lightweight_imports.html import ref_imports
+
+    markup: list[Import] = []
+    for tag, value, bundled in scan("astro", original_source).asset_refs:
+        for imp in ref_imports([(tag, value)]):
+            if not bundled and not imp.module_path.startswith((".", "/")):
+                imp.module_path = f"./{imp.module_path}"
+            markup.append(imp)
+    return markup
 
 
 def _masked_call_sites(lang: str, original_source: bytes, symbols: list[Symbol]) -> list:

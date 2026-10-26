@@ -17,6 +17,10 @@ navigation between pages rather than a dependency, and ``<img src>`` is an
 asset with no code in it; minting edges for either would inflate the graph
 without saying anything about how the code fits together.
 
+An Astro page's markup refs are read by its byte scan in ``sfc_source`` (the
+HTML grammar mis-reads Astro's ``{expr}`` attributes), then filtered by the same
+:func:`ref_imports`, so both drop external and templated values alike.
+
 Template dialects are the known ceiling. ``{% extends "base.html" %}``,
 ``{{ template "x" }}`` and ``<%= render %>`` are ordinary text to an HTML
 grammar, so a Django or Hugo template parses cleanly and yields nothing here.
@@ -25,6 +29,7 @@ That is a property of the tier, not a bug in it — see the ``html`` spec.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
 from ..models import Import
@@ -70,35 +75,24 @@ def _start_tag(node: Node) -> Node | None:
     return next((c for c in node.children if c.type in ("start_tag", "self_closing_tag")), None)
 
 
-def _walk(node: Node, out: list[tuple[str, str]], *, case_sensitive: bool = False) -> None:
+def _walk(node: Node, out: list[tuple[str, str]]) -> None:
     # <script> gets its own node type; <link> is a plain element.
     if node.type in ("script_element", "element"):
         start = _start_tag(node)
         if start is not None:
             name_node = next((c for c in start.children if c.type == "tag_name"), None)
             if name_node is not None and name_node.text is not None:
-                raw_tag = name_node.text.decode("utf-8", "replace")
-                tag = raw_tag if case_sensitive else raw_tag.lower()
+                tag = name_node.text.decode("utf-8", "replace").lower()
                 attr = _REF_ATTRS.get(tag)
                 if attr is not None:
                     value = _attributes(start).get(attr, "").strip()
                     if value:
                         out.append((tag, value))
-    elif node.type == "ERROR":
-        name_node = next((c for c in node.children if c.type == "tag_name"), None)
-        if name_node is not None and name_node.text is not None:
-            raw_tag = name_node.text.decode("utf-8", "replace")
-            tag = raw_tag if case_sensitive else raw_tag.lower()
-            attr = _REF_ATTRS.get(tag)
-            if attr is not None:
-                value = _attributes(node).get(attr, "").strip()
-                if value:
-                    out.append((tag, value))
     for child in node.children:
-        _walk(child, out, case_sensitive=case_sensitive)
+        _walk(child, out)
 
 
-def extract_html_imports(text: str, *, case_sensitive: bool = False) -> list[Import]:
+def extract_html_imports(text: str) -> list[Import]:
     """Return one ``Import`` per local ``<script src>`` / ``<link href>``."""
     from ..sfc_source import _grammar
 
@@ -115,8 +109,16 @@ def extract_html_imports(text: str, *, case_sensitive: bool = False) -> list[Imp
         return []
 
     refs: list[tuple[str, str]] = []
-    _walk(tree.root_node, refs, case_sensitive=case_sensitive)
+    _walk(tree.root_node, refs)
+    return ref_imports(refs)
 
+
+def ref_imports(refs: Iterable[tuple[str, str]]) -> list[Import]:
+    """One ``Import`` per local ``(tag, value)`` ref, in order, each path once per call.
+
+    Shared with Astro, whose refs ``sfc_source`` reads in its own markup scan. Astro
+    passes one ref per call, so its paths can repeat and the graph merges them.
+    """
     imports: list[Import] = []
     seen: set[str] = set()
     for tag, value in refs:
